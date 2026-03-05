@@ -20,12 +20,12 @@ class BrowserState:
         self.context = None
         self.page = None
         self.playwright = None
+        # --- 记忆模块：专门存储上次 fetch 到的商户名 ---
+        self.remembered_shops = [] 
 
 state = BrowserState()
 
-# --- 视觉反馈：红点锁定 ---
 async def show_click_feedback(page, x, y):
-    """在点击位置显示红点并停留 1.5 秒，让你看清 Claude 的操作"""
     await page.evaluate(f'''
         () => {{
             const dot = document.createElement('div');
@@ -48,7 +48,6 @@ async def show_click_feedback(page, x, y):
     await asyncio.sleep(1.5)
 
 async def human_smooth_scroll(page, distance):
-    """模拟真人滑动：大步幅（300-700px）确保 H5 加载"""
     scrolled = 0
     is_down = distance > 0
     abs_dist = abs(distance)
@@ -87,12 +86,12 @@ async def ensure_browser():
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        Tool(name="fetch_meituan_content", description="获取列表（实时识别环境并展示带序号的菜单或商户）", inputSchema={"type": "object"}),
-        Tool(name="smart_scroll", description="按条目数滑动（180px/条）", 
-             inputSchema={"type": "object", "properties": {"item_count": {"type": "integer"}}, "required": ["item_count"]}),
+        Tool(name="fetch_meituan_content", description="获取列表（自动判断状态并清洗商户/菜品残留）", inputSchema={"type": "object"}),
+        Tool(name="smart_scroll", description="按像素滑动", 
+             inputSchema={"type": "object", "properties": {"distance": {"type": "integer"}}, "required": ["distance"]}),
         Tool(name="click_target", description="点击餐厅名进入商店", 
              inputSchema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}),
-        Tool(name="add_food_to_cart", description="点击菜名进详情页并加购", 
+        Tool(name="add_food_to_cart", description="点击菜品名进详情页加购", 
              inputSchema={"type": "object", "properties": {"food_name": {"type": "string"}}, "required": ["food_name"]})
     ]
 
@@ -101,43 +100,43 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     await ensure_browser()
     
     if name == "fetch_meituan_content":
-        await asyncio.sleep(1)
+        await asyncio.sleep(1.5)
         content = await state.page.content()
         soup = BeautifulSoup(content, 'html.parser')
         
-        # --- 环境检测：是否已进入菜单页 ---
-        # 寻找加号按钮、菜品容器或具体的类名
-        is_in_menu = soup.select_one('.food-list, .menu-list, [class*="food-item"], [aria-label="增加"]')
+        # 识别当前页面特征
+        has_add_btn = soup.find(attrs={"aria-label": "增加"}) is not None
+        has_cart = soup.select_one('[class*="cart"], .shopping-cart') is not None
+        is_in_menu = has_add_btn or has_cart
         
-        items = []
-        if is_in_menu:
-            # 🍴 菜单模式：只抓菜品
-            selectors = ['.food-name', 'span[class*=\"name\"]', 'div[class*=\"food\"] b', '.product-name']
-            page_label = "🍴 菜单列表"
-        else:
-            # 🏠 商店列表模式
-            selectors = ['.shop-name', '.wm-item-title', 'h3', 'div[class*=\"name\"]']
-            page_label = "🏠 商店列表"
-
+        # 统一的选择器
+        selectors = ['.shop-name', '.wm-item-title', 'h3', 'div[class*="name"]', '.food-name', 'span[class*="name"]']
+        raw_list = []
         for s in selectors:
             for tag in soup.select(s):
                 txt = tag.get_text().strip()
-                # 过滤无意义字符
-                if txt and len(txt) > 1 and not any(x in txt for x in ["搜索", "配送", "评价", "月售"]):
-                    items.append(txt)
+                if txt and len(txt) > 1 and not any(x in txt for x in ["搜索", "配送", "评价", "月售", "公告"]):
+                    raw_list.append(txt)
         
-        unique_items = list(dict.fromkeys(items))
-        
-        if not unique_items:
-            return [TextContent(type="text", text=f"⚠️ 当前处于【{page_label}】，但未识别到具体项，请尝试滑动。")]
+        unique_raw = list(dict.fromkeys(raw_list))
 
-        res = f"📊 当前处于【{page_label}】，识别到 ({len(unique_items)}项)：\n" + \
-              "\n".join([f"[{i}] {s}" for i, s in enumerate(unique_items)])
+        if is_in_menu:
+            page_label = "🍴 菜单模式"
+            # --- 核心逻辑：从菜品列表里直接删掉之前记住的商户名 ---
+            final_items = [x for x in unique_raw if x not in state.remembered_shops]
+        else:
+            page_label = "🏠 商户模式"
+            final_items = unique_raw
+            # 在商户模式下，实时更新“商户名单”记忆
+            state.remembered_shops = unique_raw
+
+        res = f"📊 状态：【{page_label}】\n列表内容 ({len(final_items)}项)：\n" + \
+              "\n".join([f"[{i}] {s}" for i, s in enumerate(final_items)])
         return [TextContent(type="text", text=res)]
 
     elif name == "smart_scroll":
-        await human_smooth_scroll(state.page, arguments["item_count"] * 180)
-        return [TextContent(type="text", text="✅ 已完成滑动寻找。")]
+        await human_smooth_scroll(state.page, arguments["distance"])
+        return [TextContent(type="text", text="✅ 滑动完成")]
 
     elif name == "click_target":
         text = arguments["text"]
@@ -147,42 +146,28 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if box:
                 await show_click_feedback(state.page, box['x'] + box['width']/2, box['y'] + box['height']/2)
             await target.click()
-            await asyncio.sleep(2)
-            return [TextContent(type="text", text=f"🔴 已成功进店：{text}")]
-        return [TextContent(type="text", text=f"❌ 未能找到：{text}")]
+            await asyncio.sleep(3)
+            return [TextContent(type="text", text=f"🔴 已进入：{text}")]
+        return [TextContent(type="text", text=f"❌ 找不到：{text}")]
 
     elif name == "add_food_to_cart":
         food_name = arguments["food_name"]
-        # 先尝试在屏幕内找菜名
         target_loc = state.page.get_by_text(food_name).last
-        
-        if not await target_loc.is_visible():
-            return [TextContent(type="text", text=f"❌ 菜品 '{food_name}' 不在当前视野内，请先根据 fetch 结果计算 item_count 并调用 smart_scroll。")]
-
-        box = await target_loc.bounding_box()
-        if box:
-            # 1. 点击菜名进详情页
-            await show_click_feedback(state.page, box['x'] + box['width']/2, box['y'] + box['height']/2)
-            await target_loc.click()
-            await asyncio.sleep(2.5) 
-            
-            # 2. 在详情页寻找加购按钮
-            found_btn = False
-            for btn_text in ["加入购物车", "选好了", "确定", "下一步", "确定并加入"]:
-                btn = state.page.get_by_text(btn_text).last
-                if await btn.is_visible():
-                    b_box = await btn.bounding_box()
-                    if b_box:
-                        await show_click_feedback(state.page, b_box['x'] + b_box['width']/2, b_box['y'] + b_box['height']/2)
-                    await btn.click()
-                    found_btn = True
-                    break
-            
-            if found_btn:
-                return [TextContent(type="text", text=f"✅ 已通过详情页成功加购：{food_name}")]
-            return [TextContent(type="text", text=f"⚠️ 已进入详情页，但未发现加购按钮，可能需要手动选规格。")]
-        
-        return [TextContent(type="text", text=f"❌ 锁定菜品坐标失败")]
+        if await target_loc.is_visible():
+            box = await target_loc.bounding_box()
+            if box:
+                await show_click_feedback(state.page, box['x'] + box['width']/2, box['y'] + box['height']/2)
+                await target_loc.click()
+                await asyncio.sleep(2.5) 
+                # 详情页加购
+                for btn_txt in ["加入购物车", "选好了", "确定"]:
+                    btn = state.page.get_by_text(btn_txt).last
+                    if await btn.is_visible():
+                        b_box = await btn.bounding_box()
+                        if b_box: await show_click_feedback(state.page, b_box['x'] + b_box['width']/2, b_box['y'] + b_box['height']/2)
+                        await btn.click()
+                        return [TextContent(type="text", text=f"✅ 已通过详情页加购：{food_name}")]
+        return [TextContent(type="text", text=f"❌ 操作失败，请确保菜品可见")]
 
     raise ValueError(f"Unknown tool: {name}")
 
